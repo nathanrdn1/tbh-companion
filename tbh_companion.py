@@ -6,7 +6,7 @@ Faz upload para Firebase RTDB em users/{uid}/stage a cada 2s.
 Uso: python tbh_companion.py --uid <firebase_uid> [--hz 0.5]
 """
 
-COMPANION_VERSION = "1.2.0"
+COMPANION_VERSION = "1.2.1"
 
 import ctypes
 import ctypes.wintypes as wt
@@ -20,6 +20,8 @@ import argparse
 import threading
 import queue as _queue
 import winreg
+import shutil
+import subprocess
 from collections import deque
 
 # ── File logging (patch no builtins.print — não toca sys.stdout) ─────────────
@@ -1781,6 +1783,109 @@ VERCEL_BYPASS_SECRET = ""
 _SESSION_FILE = os.path.join(_APP_DIR, "companion_session.json")
 
 
+# ── Auto-update via GitHub Releases ───────────────────────────────────────────
+# O nome do asset é sempre "TBHTracker.exe" (sem versão no nome), então dá pra
+# resolver direto por /releases/latest sem precisar descobrir o nome primeiro.
+RELEASES_API = "https://api.github.com/repos/nathanrdn1/tbh-companion/releases/latest"
+
+
+def _parse_version(v: str) -> tuple[int, ...]:
+    v = v.strip().lstrip("vV")
+    parts = []
+    for p in v.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            break
+    return tuple(parts) or (0,)
+
+
+def _check_for_update() -> tuple[str, str] | None:
+    """Consulta o release mais recente no GitHub. Devolve (versão, url) se for
+    mais nova que a atual, ou None (sem update, ou falha de rede — nunca trava
+    o app por causa disso)."""
+    try:
+        req = _urlreq.Request(RELEASES_API, headers={"Accept": "application/vnd.github+json"})
+        with _urlreq.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        remote_ver = data.get("tag_name", "")
+        if _parse_version(remote_ver) <= _parse_version(COMPANION_VERSION):
+            return None
+        for asset in data.get("assets", []):
+            if asset.get("name") == "TBHTracker.exe":
+                return (remote_ver, asset["browser_download_url"])
+        return None
+    except Exception as e:
+        _log(f"[update] falha ao checar nova versão: {e}")
+        return None
+
+
+def _download_update(url: str) -> str | None:
+    """Baixa o novo exe pra um arquivo temporário e faz uma checagem mínima de
+    sanidade (tamanho + assinatura PE) antes de confiar nele."""
+    try:
+        tmp_path = os.path.join(os.environ.get("TEMP", _APP_DIR), f"TBHTracker_update_{os.getpid()}.exe")
+        req = _urlreq.Request(url, headers={"User-Agent": "TBHTracker-updater"})
+        with _urlreq.urlopen(req, timeout=60) as r:
+            data = r.read()
+        if len(data) < 1_000_000 or data[:2] != b"MZ":   # exe de verdade tem >1MB e header PE
+            _log(f"[update] download suspeito (size={len(data)}) — abortando update")
+            return None
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        return tmp_path
+    except Exception as e:
+        _log(f"[update] falha ao baixar nova versão: {e}")
+        return None
+
+
+def _apply_update_and_relaunch(new_exe_path: str):
+    """Sobe o novo exe em modo especial (--finish-update), que espera esse
+    processo morrer, se copia por cima do exe atual e reabre. Chamar isso e
+    encerrar o processo atual logo em seguida."""
+    target = sys.executable
+    subprocess.Popen(
+        [new_exe_path, "--finish-update", target, str(os.getpid())],
+        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        close_fds=True,
+    )
+
+
+def _finish_update(target_path: str, old_pid: int):
+    """Rodado pelo exe novo (baixado em %TEMP%) depois que o antigo já iniciou
+    o encerramento: espera o processo antigo soltar o arquivo, se copia por
+    cima dele, relança a partir do local de sempre, e sai."""
+    _log(f"[update] finalizando update — alvo={target_path} pid_antigo={old_pid}")
+    PROCESS_QUERY_LIMITED = 0x1000
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, old_pid)
+        if not h:
+            break   # processo antigo já não existe mais
+        ctypes.windll.kernel32.CloseHandle(h)
+        time.sleep(0.5)
+    # Mesmo que o handle ainda exista (timeout), tenta copiar — o arquivo só
+    # fica bloqueado enquanto o Windows tiver o EXE mapeado em memória, o que
+    # cai assim que o processo termina de verdade.
+    for attempt in range(10):
+        try:
+            shutil.copy2(sys.executable, target_path)
+            break
+        except (PermissionError, OSError) as e:
+            if attempt == 9:
+                _log(f"[update] falha ao substituir o exe: {e}")
+                return
+            time.sleep(1)
+    try:
+        subprocess.Popen([target_path], creationflags=subprocess.DETACHED_PROCESS)
+    except Exception as e:
+        _log(f"[update] falha ao relançar: {e}")
+    try:
+        os.remove(sys.executable)   # limpa o temporário em %TEMP%
+    except Exception:
+        pass
+
+
 def _copy_to_clipboard(text: str):
     """Copia texto pra área de transferência via Win32 puro (sem lib nova;
     tkinter exigiria rodar na mesma thread do mainloop, que já está ocupada
@@ -2533,6 +2638,14 @@ class SplashScreen:
 
 
 def main():
+    # Modo especial: esse processo é o exe novo baixado em %TEMP%, chamado pelo
+    # exe antigo pra terminar a auto-atualização. Não é o app normal — só
+    # espera o antigo sair, se copia por cima dele, relança, e sai. Checado
+    # antes de qualquer outra coisa (kill_previous_instance incluído).
+    if len(sys.argv) >= 4 and sys.argv[1] == "--finish-update":
+        _finish_update(sys.argv[2], int(sys.argv[3]))
+        return
+
     _kill_previous_instance()
 
     ap = argparse.ArgumentParser(description="TBH Tracker")
@@ -2564,9 +2677,27 @@ def main():
         except Exception:
             pass
 
-    _shared = {"email": session.get('email') if session else None}
+    _shared    = {"email": session.get('email') if session else None}
+    _updating  = threading.Event()
 
     def _loop():
+        # Checa versão nova ANTES de tudo (mesmo antes do pareamento) — se o
+        # build atual tiver algum problema, uma versão nova já resolve sozinha
+        # sem o usuário precisar ir no site baixar de novo.
+        if getattr(sys, 'frozen', False):
+            update = _check_for_update()
+            if update:
+                new_ver, url = update
+                _log(f"[update] nova versão disponível: {new_ver}")
+                _status_cb(f"Atualizando para v{new_ver}...")
+                new_exe = _download_update(url)
+                if new_exe:
+                    _updating.set()
+                    _apply_update_and_relaunch(new_exe)
+                    _status_cb("__CLOSE__")
+                    return
+                _log("[update] download falhou — seguindo com a versão atual")
+
         client_session = session
         if not client_session:
             paired = _pair(_status_cb)
@@ -2589,6 +2720,12 @@ def main():
         splash.run()   # bloqueia até receber __CLOSE__ ou janela ser fechada
     except Exception:
         pass   # se tkinter não disponível, ignora
+
+    if _updating.is_set():
+        # O exe novo já foi disparado (subprocess separado) e vai assumir o
+        # lugar assim que esse processo terminar — não faz sentido abrir a
+        # bandeja pra uma versão que está prestes a ser substituída.
+        return
 
     # ── Tray icon: toma conta da thread principal após splash ─────────────
     try:
