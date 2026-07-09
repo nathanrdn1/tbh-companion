@@ -1,0 +1,6 @@
+# Dependências do companion (leitura de memória + tray + build do exe)
+cryptography>=42.0      # desencriptação ES3 do save (AES-CBC / PBKDF2)
+pystray>=0.19           # ícone na bandeja do sistema
+Pillow>=10.0            # geração do ícone/splash
+pyinstaller>=6.0        # empacotamento do TBHTracker.exe
+# tkinter: já vem na stdlib do Python (splash)
