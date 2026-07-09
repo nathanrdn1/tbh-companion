@@ -6,7 +6,7 @@ Faz upload para Firebase RTDB em users/{uid}/stage a cada 2s.
 Uso: python tbh_companion.py --uid <firebase_uid> [--hz 0.5]
 """
 
-COMPANION_VERSION = "1.2.1"
+COMPANION_VERSION = "1.2.2"
 
 import ctypes
 import ctypes.wintypes as wt
@@ -1808,7 +1808,7 @@ def _check_for_update() -> tuple[str, str] | None:
         req = _urlreq.Request(RELEASES_API, headers={"Accept": "application/vnd.github+json"})
         with _urlreq.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
-        remote_ver = data.get("tag_name", "")
+        remote_ver = data.get("tag_name", "").lstrip("vV")   # "v1.2.1" -> "1.2.1"
         if _parse_version(remote_ver) <= _parse_version(COMPANION_VERSION):
             return None
         for asset in data.get("assets", []):
