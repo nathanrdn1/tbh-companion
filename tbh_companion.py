@@ -6,7 +6,7 @@ Faz upload para Firebase RTDB em users/{uid}/stage a cada 2s.
 Uso: python tbh_companion.py --uid <firebase_uid> [--hz 0.5]
 """
 
-COMPANION_VERSION = "1.2.3"
+COMPANION_VERSION = "1.2.4"
 
 import ctypes
 import ctypes.wintypes as wt
@@ -223,33 +223,118 @@ def _log(msg: str):
         pass
 
 
+def _decrypt_save() -> dict | None:
+    """Decripta o save ES3 e devolve o PlayerSaveData parseado (psd), ou None.
+    Python usa int de precisão arbitrária, então UniqueIds grandes ficam exatos."""
+    if not _CRYPTO_OK or not os.path.exists(SAVE_PATH):
+        return None
+    with open(SAVE_PATH, 'rb') as f:
+        data = f.read()
+    iv         = data[:16]
+    ciphertext = data[16:]
+    kdf = PBKDF2HMAC(algorithm=SHA1(), length=16, salt=iv,
+                     iterations=100, backend=default_backend())
+    key = kdf.derive(ES3_PASSWORD)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    dec = cipher.decryptor()
+    plain = dec.update(ciphertext) + dec.finalize()
+    plain = plain[:-plain[-1]]   # remove PKCS7 padding
+    raw = json.loads(plain.decode('utf-8'))
+    psd_raw = raw.get('PlayerSaveData', {}).get('value', '{}')
+    return json.loads(psd_raw) if isinstance(psd_raw, str) else psd_raw
+
+
 def _read_save_heroes() -> list[str]:
     """Lê arrangedHeroKey do save ES3 e retorna lista de class names."""
-    if not _CRYPTO_OK or not os.path.exists(SAVE_PATH):
-        return []
     try:
-        with open(SAVE_PATH, 'rb') as f:
-            data = f.read()
-        iv         = data[:16]
-        ciphertext = data[16:]
-        kdf = PBKDF2HMAC(algorithm=SHA1(), length=16, salt=iv,
-                         iterations=100, backend=default_backend())
-        key = kdf.derive(ES3_PASSWORD)
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv),
-                        backend=default_backend())
-        dec = cipher.decryptor()
-        plain = dec.update(ciphertext) + dec.finalize()
-        pad = plain[-1]
-        plain = plain[:-pad]
-        raw = json.loads(plain.decode('utf-8'))
-        psd_raw = raw.get('PlayerSaveData', {}).get('value', '{}')
-        psd = json.loads(psd_raw) if isinstance(psd_raw, str) else psd_raw
-        cs  = psd.get('commonSaveData', {})
-        keys = [k for k in (cs.get('arrangedHeroKey') or []) if k and k != -1]
+        psd = _decrypt_save()
+        if not psd:
+            return []
+        keys = [k for k in (psd.get('commonSaveData', {}).get('arrangedHeroKey') or []) if k and k != -1]
         return [HERO_CLS_NAME.get(k, str(k)) for k in keys]
     except Exception as e:
         print(f"[heroes] erro lendo save: {e}")
         return []
+
+
+def _stable_json(v) -> str:
+    """JSON com chaves ordenadas recursivamente (bate com _stableStringify do site)."""
+    if v is None or isinstance(v, (int, float, str, bool)):
+        return json.dumps(v)
+    if isinstance(v, list):
+        return '[' + ','.join(_stable_json(x) for x in v) + ']'
+    keys = sorted(v.keys())
+    return '{' + ','.join(json.dumps(k) + ':' + _stable_json(v[k]) for k in keys) + '}'
+
+
+def _party_hash(obj) -> str:
+    """FNV-1a 32-bit em base36 do snapshot estável — dedup de party (igual partyFingerprint)."""
+    s = _stable_json(obj)
+    h = 0x811c9dc5
+    for ch in s:
+        h = ((h ^ ord(ch)) * 0x01000193) & 0xffffffff
+    # base36
+    if h == 0:
+        return 'p0'
+    digs = '0123456789abcdefghijklmnopqrstuvwxyz'
+    out = ''
+    n = h
+    while n:
+        out = digs[n % 36] + out
+        n //= 36
+    return 'p' + out
+
+
+def _read_party_snapshot() -> tuple[dict | None, str | None]:
+    """Lê a party COMPLETA do save (heróis arranjados + itens equipados + encantos +
+    skills) em formato CRU pra o site interpretar com a wiki (mesmos campos que o
+    parsePlayerSave/buildPartySnapshot esperam). Devolve (player_subset, hash) ou
+    (None, None). UniqueIds viram string (evita perda de precisão no JSON/JS)."""
+    try:
+        psd = _decrypt_save()
+        if not psd:
+            return None, None
+        arranged = [k for k in (psd.get('commonSaveData', {}).get('arrangedHeroKey') or [])
+                    if k and k != -1]
+        if not arranged:
+            return None, None
+        hero_by_key = {h.get('heroKey'): h for h in (psd.get('heroSaveDatas') or [])}
+        equipped_ids: set[str] = set()
+        heroes_out = []
+        for k in arranged:
+            h = hero_by_key.get(k)
+            if not h:
+                continue
+            eids = [str(x) for x in (h.get('equippedItemIds') or [])]
+            equipped_ids.update(x for x in eids if x and x != '0')
+            heroes_out.append({
+                'heroKey':          k,
+                'HeroLevel':        h.get('HeroLevel', 0),
+                'equippedItemIds':  eids,
+                'equippedSKillKey': [s for s in (h.get('equippedSKillKey') or []) if s and s > 0],
+            })
+        items_out = []
+        for i in (psd.get('itemSaveDatas') or []):
+            uid = str(i.get('UniqueId'))
+            if uid in equipped_ids:
+                items_out.append({
+                    'UniqueId':    uid,
+                    'ItemKey':     i.get('ItemKey'),
+                    'EnchantData': i.get('EnchantData') or [],
+                })
+        attrs_out = [{'Key': a.get('Key'), 'Level': a.get('Level')}
+                     for a in (psd.get('attributeSaveDatas') or [])
+                     if (a.get('Level') or 0) > 0 and (a.get('Key', 0) // 1000) in arranged]
+        player = {
+            'commonSaveData':     {'arrangedHeroKey': arranged},
+            'heroSaveDatas':      heroes_out,
+            'itemSaveDatas':      items_out,
+            'attributeSaveDatas': attrs_out,
+        }
+        return player, _party_hash(player)
+    except Exception as e:
+        print(f"[party] erro lendo save: {e}")
+        return None, None
 
 DIFFICULTY = {0: "Normal", 1: "Nightmare", 2: "Hell", 3: "Torment"}
 
@@ -2225,8 +2310,19 @@ class BackendClient:
 
     def push_history(self, record: dict):
         try:
+            # Build da party NO MOMENTO do clear (dados crus do save; o site interpreta
+            # com a wiki no display). Enviado ANTES do history pra o leaderboard
+            # server-side já linkar o partyHash. Só em success (pra não gravar toa).
+            if record.get('outcome') == 'success':
+                player, phash = _read_party_snapshot()
+                if player and phash:
+                    record['partyHash'] = phash
+                    try:
+                        self._post("party", {"hash": phash, "player": player})
+                    except Exception as e:
+                        _log(f"[backend] set_party error: {e}")
             self._post("history", record)
-            _log(f"[backend] push_history OK — key={record['startTs']} outcome={record.get('outcome')}")
+            _log(f"[backend] push_history OK — key={record['startTs']} outcome={record.get('outcome')} party={record.get('partyHash')}")
         except Exception as e:
             _log(f"[backend] push_history error: {e}")
 
@@ -2623,6 +2719,17 @@ def _close_stage(client, reader: "StageReader", stage_key, start_ts, end_ts,
     boxes = boxes or []
     box_types = [_BOX_LABEL.get(b, str(b)) for b in boxes]
 
+    # Gold e kills do stage que fechou (reader ainda tem o estado, antes do reset).
+    try:
+        g0, g1 = reader._gold_start, reader._read_combat_gold()
+        gold_total = max(0, g1 - g0) if (g1 is not None and g0 is not None) else None
+    except Exception:
+        gold_total = None
+    try:
+        mobs_killed = reader._raw_dead_count() or None
+    except Exception:
+        mobs_killed = None
+
     record = {
         "stageKey":   stage_key,
         "startTs":    start_ts,
@@ -2636,6 +2743,8 @@ def _close_stage(client, reader: "StageReader", stage_key, start_ts, end_ts,
         "boxes":      box_types,
         "heroes":     heroes or [],
     }
+    if gold_total is not None:  record["goldTotal"]  = gold_total
+    if mobs_killed is not None: record["mobsKilled"] = mobs_killed
     if game_secs:
         record["clearTimeSec"] = game_secs
     # Identidade (act/stage/diff/label): do StageClearLog (log_info), não do decode.
