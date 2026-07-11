@@ -6,7 +6,7 @@ Faz upload para Firebase RTDB em users/{uid}/stage a cada 2s.
 Uso: python tbh_companion.py --uid <firebase_uid> [--hz 0.5]
 """
 
-COMPANION_VERSION = "1.2.2"
+COMPANION_VERSION = "1.2.3"
 
 import ctypes
 import ctypes.wintypes as wt
@@ -37,8 +37,33 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# ── Diretório gerenciado (%LOCALAPPDATA%\TBHTracker) ─────────────────────────
+# Casa fixa do app: exe instalado, logs\ e os caches de calibração ficam todos
+# aqui. Definido cedo porque o logging abaixo já grava em logs\. _APP_DIR (mais
+# abaixo) resolve pro MESMO caminho — mantidos em sincronia de propósito.
+_MANAGED_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "TBHTracker")
+_LOGS_DIR    = os.path.join(_MANAGED_DIR, "logs")
+
+def _prune_old_logs(keep: int = 5):
+    """Mantém só os N logs de sessão mais recentes em logs\\ (evita crescer sem fim)."""
+    try:
+        logs = sorted(
+            (os.path.join(_LOGS_DIR, f) for f in os.listdir(_LOGS_DIR)
+             if f.startswith("tbh_companion_") and f.endswith(".log")),
+            key=os.path.getmtime,
+        )
+        for old in logs[:-keep]:
+            try: os.remove(old)
+            except OSError: pass
+    except OSError:
+        pass
+
 try:
-    _log_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "tbh_companion.log")
+    os.makedirs(_LOGS_DIR, exist_ok=True)
+    _prune_old_logs()
+    # Timestamp no nome → histórico de sessões (rotacionado por _prune_old_logs),
+    # em vez de sobrescrever um único arquivo a cada abertura.
+    _log_path = os.path.join(_LOGS_DIR, time.strftime("tbh_companion_%Y%m%d-%H%M%S.log"))
     _log_file = open(_log_path, "w", encoding="utf-8", buffering=1)
 except Exception:
     pass
@@ -164,6 +189,21 @@ def _resource_path(rel: str) -> str:
 
 CALIB_SEED_PATH = _resource_path("calib_seed.json")
 
+# Catálogo ESTÁTICO do jogo, indexado pelo stageKey REAL: {stageKey: [act, stageNo,
+# diff, totalMobs]}. Dado do jogo (não aprendido, não lido da memória a cada tick):
+# identidade E total corretos na hora em qualquer stage. Atualizar quando o jogo
+# mudar os stages (regenerar de stages.json). Ver stage_totals.json.
+def load_stage_catalog() -> dict:
+    try:
+        with open(_resource_path("stage_totals.json"), encoding="utf-8") as f:
+            raw = json.load(f).get("byKey", {})
+        return {int(k): v for k, v in raw.items()}
+    except Exception:
+        return {}
+
+STAGE_CATALOG = load_stage_catalog()      # stageKey → [act, stageNo, diff, totalMobs]
+STAGE_KEYS    = set(STAGE_CATALOG)        # keys válidas (p/ validar o offset do stageKey)
+
 SAVE_PATH = os.path.expandvars(
     r"%USERPROFILE%\AppData\LocalLow\TesseractStudio\TaskbarHero\SaveFile_Live.es3"
 )
@@ -172,7 +212,7 @@ HERO_CLS_NAME = {101:'Knight', 201:'Ranger', 301:'Sorcerer',
                  401:'Priest', 501:'Abalist', 601:'Slayer'}
 
 
-_LOG_PATH = os.path.join(os.path.expanduser("~"), "TBHTracker_startup.log")
+_LOG_PATH = os.path.join(_LOGS_DIR, "companion.log")
 
 def _log(msg: str):
     print(msg)
@@ -215,6 +255,18 @@ DIFFICULTY = {0: "Normal", 1: "Nightmare", 2: "Hell", 3: "Torment"}
 
 # Mapa de diff_code do prefixo do stageKey → diff_idx
 _SK_DIFF_CODE = {1: 0, 2: 1, 3: 2, 9: 3}
+
+def _diff_from_stage_key(sk: int):
+    """Só a dificuldade, do dígito-líder do stageKey — robusto mesmo quando o decode
+    completo falha (act/stage fora de faixa). É a parte estável entre versões."""
+    if not sk or sk <= 0:
+        return None
+    if sk >= 100_000:
+        return _SK_DIFF_CODE.get(sk // 100_000)
+    if sk < 10_000:
+        d = (sk // 1000) - 1
+        return d if 0 <= d <= 3 else None
+    return None
 
 def _decode_stage_key(sk: int):
     """Decodifica stageKey em (act, stage_no, diff_idx) sem precisar de stage_info.
@@ -424,7 +476,7 @@ def singleton_instance(mem: Reader, klass: int) -> int | None:
     return mem.rptr(static_flds + SINGLETON_INSTANCE)
 
 # ── Auto-detect anchor_rva ────────────────────────────────────────────────────
-_APP_DIR      = os.path.join(os.path.expandvars("%LOCALAPPDATA%"), "TBHTracker")
+_APP_DIR      = _MANAGED_DIR   # mesmo diretório gerenciado definido no topo (exe, logs\, caches)
 _ANCHOR_CACHE = os.path.join(_APP_DIR, "anchor_cache.json")
 _LOCK_FILE    = os.path.join(_APP_DIR, "tbhtracker.lock")
 
@@ -754,6 +806,11 @@ class StageReader:
         self._lm_idx_hint:  int | None = None    # idx da classe LogManager já achada por nome
                                                  # (evita re-scan lento nos retries)
         self._lm_scanned:   bool       = False   # scan por nome já rodou (só 1x por sessão)
+        self._seeded:       bool       = False   # calib veio do calib_seed (não precisa reportar)
+        # Identidade (act/stage) do último StageClearLog — fonte de verdade da
+        # identidade do stage no 1.00.27+ (o stageKey deixou de ser decodificável
+        # por fórmula; ver _identity_from). Atualizado por read_last_clear_info.
+        self._last_clear_id: dict | None = None
         self._status_cb                = None   # callback p/ mostrar progresso na splash
 
     def set_status_cb(self, cb):
@@ -794,6 +851,7 @@ class StageReader:
 
         if entry:
             self._calib = entry
+            self._seeded = True   # versão já no calib_seed — nada a reportar
             self._table = typeinfo_table_base(self._mem, ga_base, entry["anchor_rva"])
             _log(f"[attach] pid={pid} ver={ver} calib=OK table={'0x'+hex(self._table)[2:] if self._table else 'None'}")
         else:
@@ -1014,6 +1072,33 @@ class StageReader:
             self.capture_log_baselines()
             _log("[retry] LogManager resolvido durante o loop — detecção oficial de clear ativa")
 
+    def calib_snapshot(self) -> dict | None:
+        """Devolve os offsets calibrados SE a calibração está completa e saudável
+        (anchor + MonsterSpawnManager + LogManager + AggregateManager resolvidos).
+        É o material pra semear o calib_seed.json de uma versão auto-escaneada:
+        quase uma entrada pronta (falta só stage_info/hero_cat/item_cat, que são
+        carregados da entrada anterior por serem tolerantes a versão).
+        None enquanto algo ainda falta (ex.: LogManager resolve lazy no 1º clear)."""
+        c = self._calib
+        if not c or not self._has_log:
+            return None
+        idxs   = c.get("indices", {})
+        anchor = c.get("anchor_rva")
+        msm    = idxs.get("MonsterSpawnManager")
+        lm     = idxs.get("LogManager")
+        agg    = c.get("idx_ut")
+        if anchor is None or msm is None or lm is None or agg is None:
+            return None
+        return {
+            "anchor_rva":   anchor,
+            "idx_ut":       agg,
+            "indices":      idxs,
+            "lm_dict_off":  self._lm_dict_off,
+            "agg_dict_off": self._agg_dict_off,
+            "scl_base":     self._scl_base,
+            "seeded":       self._seeded,
+        }
+
     # ── AggregateManager (ouro): classe OFUSCADA — achada por comportamento ─────
     def _agg_dict_ok(self, inst: int, off: int) -> bool:
         """Assinatura única da AggregateManager: dict de EAggregateType com
@@ -1226,15 +1311,25 @@ class StageReader:
             if len(vals) >= 2 and len(set(vals)) == 1:
                 consistent[SCAN_START + off] = vals[0]
 
-        # stageKey: valor plausível (>1000) mais próximo do hint histórico
-        sk_candidates = {o: v for o, v in consistent.items() if 100 < v < 9_999_999}
-        if not sk_candidates:
+        # stageKey: PRIORIDADE 1 = um campo cujo valor é uma key REAL do catálogo do
+        # jogo (stages.json). Isso trava no offset certo (o valor bruto vira o stageKey
+        # de verdade, que indexa identidade+total). Fallback: valor plausível mais
+        # próximo do hint histórico (versões/stages fora do catálogo).
+        real_candidates = {o: v for o, v in consistent.items() if v in STAGE_KEYS}
+        sk_candidates   = {o: v for o, v in consistent.items() if 100 < v < 9_999_999}
+        if real_candidates:
+            hint = MONSTER_STAGE_KEY
+            self._stagekey_off = min(real_candidates, key=lambda o: abs(o - hint))
+            stage_key_val = real_candidates[self._stagekey_off]
+            _log(f"[attach] stagekey_off=0x{self._stagekey_off:x} val={stage_key_val} (key do catálogo)")
+        elif sk_candidates:
+            hint = MONSTER_STAGE_KEY
+            self._stagekey_off = min(sk_candidates, key=lambda o: abs(o - hint))
+            stage_key_val = sk_candidates[self._stagekey_off]
+            _log(f"[attach] stagekey_off=0x{self._stagekey_off:x} val={stage_key_val} (heurística)")
+        else:
             _log("[attach] detect: sem candidatos para stageKey")
             return False
-        hint = MONSTER_STAGE_KEY
-        self._stagekey_off = min(sk_candidates, key=lambda o: abs(o - hint))
-        stage_key_val = sk_candidates[self._stagekey_off]
-        _log(f"[attach] stagekey_off=0x{self._stagekey_off:x} val={stage_key_val}")
 
         # act: valor consistente em 1-3
         act_candidates = {o: v for o, v in consistent.items()
@@ -1268,6 +1363,35 @@ class StageReader:
 
         return True
 
+    def _dump_consistent_fields(self, arr: int, count: int):
+        """Diagnóstico (ativado por env TBH_DUMP_OFFSETS): dumpa TODOS os campos
+        int32 CONSISTENTES entre os monstros do stage atual, na faixa 0x100–0x600.
+        Rodando isto em 2 stages conhecidos e diffando os mapas, acha-se quais
+        offsets carregam act/stage/difficulty/stageKey na versão atual do jogo."""
+        LO, HI = 0x100, 0x600
+        raws = []
+        for i in range(min(8, count)):
+            u = self._mem.rptr(arr + ARRAY_DATA + i * 8)
+            if not u:
+                continue
+            blk = self._mem.read(u + LO, HI - LO)
+            if blk:
+                raws.append(blk)
+        if len(raws) < 2:
+            return
+        small, keyish = {}, {}
+        for off in range(0, len(raws[0]) - 3, 4):
+            vals = [struct.unpack_from('<i', m, off)[0] for m in raws if len(m) > off + 3]
+            if len(vals) >= 2 and len(set(vals)) == 1:
+                v = vals[0]
+                if 0 <= v <= 60:
+                    small[LO + off] = v
+                elif 1000 <= v < 9_999_999:
+                    keyish[LO + off] = v
+        _hx = lambda d: {hex(k): v for k, v in sorted(d.items())}
+        _log(f"[dump] small (act/stage/diff?): {_hx(small)}")
+        _log(f"[dump] keyish (stageKey?):     {_hx(keyish)}")
+
     # ── Stage key ─────────────────────────────────────────────────────────────
     def _stage_key(self) -> int | None:
         msm = self._singleton("MonsterSpawnManager")
@@ -1289,6 +1413,14 @@ class StageReader:
             if not self._detect_monster_offsets(arr, count):
                 return None
 
+        # Diagnóstico de offsets (env TBH_DUMP_OFFSETS=1): a cada ~5s dumpa o mapa
+        # completo de campos consistentes, pra achar os offsets certos por versão.
+        if os.environ.get("TBH_DUMP_OFFSETS"):
+            _now = time.time()
+            if _now >= getattr(self, "_dump_next", 0):
+                self._dump_next = _now + 5.0
+                self._dump_consistent_fields(arr, count)
+
         keys, acts, snos, diffs = [], [], [], []
         for i in range(min(10, count)):
             u = self._mem.rptr(arr + ARRAY_DATA + i * 8)
@@ -1309,6 +1441,7 @@ class StageReader:
                 d = self._mem.ri32(u + self._diff_off)
                 if d is not None and 0 <= d <= 3:
                     diffs.append(d)
+
 
         if not keys:
             return None
@@ -1508,6 +1641,22 @@ class StageReader:
         print(f"[lm_dump] lm=0x{lm:x} dict=0x{dict_ptr:x} entries={entries}")
         print(f"[lm_dump] baseline: clear={self._log_clear_sz} fail={self._log_fail_sz} box={self._log_box_sz}")
 
+    def _all_log_sizes(self) -> dict:
+        """Diagnóstico: {elogtype: tamanho} de todas as listas do LogManager."""
+        lm = self._singleton("LogManager")
+        if not lm:
+            return {}
+        dp = self._mem.rptr(lm + self._lm_dict_off)
+        if not dp:
+            return {}
+        out = {}
+        for k, v in iter_dict8b(self._mem, dp):
+            if v:
+                sz = self._mem.ri32(v + LIST_SIZE)
+                if sz is not None:
+                    out[k] = sz
+        return out
+
     def check_events(self) -> str | None:
         """Detecta StageClearLog/StageFailedLog. Retorna 'success', 'fail' ou None.
 
@@ -1570,8 +1719,39 @@ class StageReader:
                     info["clearTime"] = clear_time   # segundos
                 if is_boss is not None:
                     info["isBoss"] = is_boss
+                # Cacheia a identidade p/ o display ao vivo entre clears (farm idle
+                # repete o mesmo stage → última entrada = stage atual).
+                self._last_clear_id = {"act": act, "stageNo": stage_no}
                 return info
         return None
+
+    def _identity_from(self, stage_key, log_info: dict | None = None) -> dict:
+        """Identidade do stage (act/stage/diff/label). FONTE DE VERDADE do act/stage:
+        o StageClearLog do jogo (log_info desta close, ou a última entrada cacheada).
+        O stageKey NÃO é decodificado por fórmula para act/stage — a codificação
+        mudou no 1.00.27 e a fórmula erra (ex.: 3-9 lido como 1-8). A dificuldade
+        vem do dígito-líder do stageKey (a parte robusta do decode). Só quando não
+        há log oficial nenhum (versões antigas) cai no decode aritmético completo."""
+        # PRIORIDADE 1: catálogo do jogo indexado pelo stageKey REAL (act/stage/diff
+        # exatos, incl. dificuldade correta). Depende do offset do stageKey estar certo.
+        cat = STAGE_CATALOG.get(stage_key)
+        if cat:
+            act, sno, diff = cat[0], cat[1], cat[2]
+        else:
+            info = log_info or self._last_clear_id
+            if info and info.get("act") and info.get("stageNo"):
+                act, sno = info["act"], info["stageNo"]
+                diff = _diff_from_stage_key(stage_key)   # dificuldade robusta (dígito-líder)
+            else:
+                act, sno, diff = _decode_stage_key(stage_key)   # legado (sem log oficial)
+        if not act or not sno:
+            return {}
+        diff_name = DIFFICULTY.get(diff, '') if diff is not None else ''
+        out = {"act": act, "stageNo": sno, "label": f"{diff_name} {act}-{sno}".strip()}
+        if diff is not None:
+            out["difficulty"] = diff
+            out["diffName"]   = diff_name
+        return out
 
     def capture_log_baselines(self):
         """Captura os tamanhos atuais dos logs como novo baseline."""
@@ -1718,31 +1898,18 @@ class StageReader:
         if gold_delta is not None:
             result["goldTotal"] = gold_delta
 
-        # Enriquece com stage_info do calib
-        if self._calib:
-            info = self._calib.get("stage_info", {}).get(str(stage_key))
-            if info and len(info) >= 4:
-                act, stage_no, total_mobs, diff_idx = info
-                diff_name = DIFFICULTY.get(diff_idx, str(diff_idx))
-                result.update({
-                    "act":        act,
-                    "stageNo":    stage_no,
-                    "difficulty": diff_idx,
-                    "diffName":   diff_name,
-                    "totalMobs":  total_mobs,
-                    "label":      f"{diff_name} {act}-{stage_no}",
-                })
-            else:
-                # Fallback: decodifica o próprio stageKey (cobre Torment e versões futuras)
-                act, sno, diff = _decode_stage_key(stage_key)
-                if act and sno:
-                    diff_name = DIFFICULTY.get(diff, '') if diff is not None else ''
-                    result.update({
-                        "act":     act,
-                        "stageNo": sno,
-                        **({"difficulty": diff, "diffName": diff_name} if diff is not None else {}),
-                        "label":   f"{diff_name} {act}-{sno}".strip(),
-                    })
+        # Identidade (act/stage/diff/label): do StageClearLog do jogo, não do
+        # decode do stageKey. read_last_clear_info() atualiza o cache _last_clear_id.
+        self.read_last_clear_info()
+        ident = self._identity_from(stage_key)
+        if ident:
+            result.update(ident)
+
+        # totalMobs (barra de progresso): catálogo estático do jogo pelo stageKey real.
+        # O run_loop ainda sobrepõe com adaptativo se faltar.
+        cat = STAGE_CATALOG.get(stage_key)
+        if cat and cat[3] > 0:
+            result["totalMobs"] = cat[3]
 
         return result
 
@@ -1774,7 +1941,9 @@ class StageReader:
 import urllib.request as _urlreq
 import webbrowser
 
-BACKEND_BASE  = "https://www.tbhtracker.online"  # produção
+# Backend: produção por padrão; sobrescreve por env TBH_BACKEND ou --backend
+# (útil pra testar contra o localhost/dev sem rebuildar).
+BACKEND_BASE  = os.environ.get("TBH_BACKEND", "https://www.tbhtracker.online").rstrip("/")
 # Protection Bypass for Automation — só é preciso se o backend estiver atrás
 # de Deployment Protection da Vercel (ex.: testando contra um preview). Vazio
 # = nenhum header extra é enviado. Nunca commitar um valor real aqui (esse
@@ -1886,6 +2055,43 @@ def _finish_update(target_path: str, old_pid: int):
         pass
 
 
+def _ensure_installed() -> bool:
+    """Na 1ª execução a partir de fora do diretório gerenciado (ex.: baixado na
+    pasta Downloads), copia o exe pra %LOCALAPPDATA%\\TBHTracker\\TBHTracker.exe e
+    relança de lá. Assim o app 'mora' num lugar fixo, logs\\ e caches ficam ao
+    lado, e o auto-update passa a se sobrescrever ali em vez de na Downloads
+    (hoje ele copia por cima do local de origem — se for a Downloads, fica lá).
+
+    Só age no exe congelado (PyInstaller); em dev (python .py) é no-op.
+    Devolve True se relançou (o chamador deve encerrar esta cópia)."""
+    if not getattr(sys, "frozen", False):
+        return False
+    cur    = os.path.abspath(sys.executable)
+    target = os.path.join(_MANAGED_DIR, "TBHTracker.exe")
+    if os.path.normcase(cur) == os.path.normcase(target):
+        return False   # já rodando do local instalado
+    try:
+        os.makedirs(_MANAGED_DIR, exist_ok=True)
+        # Recopia se ainda não existe ou se o tamanho difere (versão nova baixada
+        # manualmente na Downloads deve substituir a instalada).
+        if not os.path.exists(target) or os.path.getsize(target) != os.path.getsize(cur):
+            shutil.copy2(cur, target)
+            _log(f"[install] instalado em {target}")
+    except Exception as e:
+        if not os.path.exists(target):
+            _log(f"[install] não instalou e não há cópia instalada ({e}) — seguindo daqui")
+            return False
+        # Cópia falhou (provável: instalação já em uso), mas existe uma válida.
+        _log(f"[install] cópia falhou ({e}); relançando a instalação existente")
+    try:
+        subprocess.Popen([target], creationflags=subprocess.DETACHED_PROCESS)
+        _log("[install] relançando a partir do diretório gerenciado")
+        return True
+    except Exception as e:
+        _log(f"[install] falha ao relançar de {target}: {e} — seguindo daqui")
+        return False
+
+
 def _copy_to_clipboard(text: str):
     """Copia texto pra área de transferência via Win32 puro (sem lib nova;
     tkinter exigiria rodar na mesma thread do mainloop, que já está ocupada
@@ -1938,11 +2144,11 @@ def _load_session() -> dict | None:
     return None
 
 
-def _save_session(token: str, email: str | None = None):
+def _save_session(token: str, email: str | None = None, backend: str | None = None):
     try:
         os.makedirs(_APP_DIR, exist_ok=True)
         with open(_SESSION_FILE, "w", encoding="utf-8") as f:
-            json.dump({"token": token, "email": email}, f)
+            json.dump({"token": token, "email": email, "backend": backend or BACKEND_BASE}, f)
     except Exception as e:
         _log(f"[pairing] erro ao salvar sessão: {e}")
 
@@ -2030,6 +2236,17 @@ class BackendClient:
         except Exception as e:
             _log(f"[backend] set_box_drop error: {e}")
 
+    def report_calib(self, version: str, calib: dict):
+        """Reporta os offsets calibrados desta versão do jogo pro backend, pra
+        você semear o calib_seed.json e ninguém mais precisar auto-escanear.
+        Best-effort — nunca atrapalha o loop se falhar."""
+        try:
+            _http_post_json(f"{BACKEND_BASE}/api/companion/calib",
+                            {"token": self._token, "version": version, "calib": calib})
+            _log(f"[calib] reportado ao backend — ver={version} msm_idx={calib.get('indices',{}).get('MonsterSpawnManager')}")
+        except Exception as e:
+            _log(f"[calib] falha ao reportar calibração: {e}")
+
 
 class ConsoleClient:
     def set_current(self, data: dict):
@@ -2057,10 +2274,26 @@ def run_loop(client, hz: float = 0.5, stop_event: threading.Event | None = None,
     # Pending close: após detectar outcome, aguardamos 1 tick extra para capturar
     # o GetBoxLog do boss (aparece ~0.6s depois do StageClearLog)
     pending: dict | None = None   # {'key', 'start_ts', 'end_ts', 'outcome', 'box_baseline'}
+    # Abandono adiado: numa troca de stage com log oficial, guarda o stage anterior e
+    # espera ~alguns ticks. Se um clear/fail aparecer no log nesse meio → foi conclusão
+    # (descarta, sem duplicata); senão → fecha como 'abandoned'.
+    pending_abandon: dict | None = None
+    ABANDON_WAIT_TICKS = 3
+    _prev_log_sizes: dict = {}
     _first_stage_done = False      # primeira run após iniciar sempre é inválida (companion abriu mid-stage)
     _msm_dump_ticks   = 0          # quantas vezes já dumpamos o MSM (para diagnóstico)
-    lap_totals: dict[int, int] = {}  # stageKey -> kills no último clear (total real p/ a barra)
+    lap_totals: dict[str, int] = {}  # identidade(diff-act-stage) -> kills no último clear (total p/ a barra)
     lap_peak_kills = 0             # pico de mobsKilled no lap atual (base do total adaptativo)
+    calib_reported = False         # já reportamos a calibração desta sessão ao backend?
+
+    def _lap_key(d: dict | None):
+        # Chave estável do stage pela IDENTIDADE (diff-act-stage), não pelo stageKey
+        # bruto — o stageKey oscila entre laps (ex.: 910801↔920801) e faria o total
+        # adaptativo nunca casar com o lap atual.
+        if not d:
+            return None
+        a, s, diff = d.get("act"), d.get("stageNo"), d.get("difficulty")
+        return f"{diff}-{a}-{s}" if a and s else None
 
     def _status(msg: str):
         if status_q:
@@ -2080,8 +2313,10 @@ def run_loop(client, hz: float = 0.5, stop_event: threading.Event | None = None,
         # na 1ª run (baseline da dead-list ainda não setado → contagem inflada) e
         # aplica teto de sanidade contra valores absurdos. Usa MÁXIMO (não sobrescreve)
         # para convergir pro total real e não encolher a barra numa lap contada parcial.
-        if not was_first and key and outcome == 'success' and 0 < lap_peak_kills < 2000:
-            lap_totals[key] = max(lap_totals.get(key, 0), lap_peak_kills)
+        if not was_first and outcome == 'success' and 0 < lap_peak_kills < 2000:
+            _idk = _lap_key(reader._identity_from(key, kwargs.get('log_info')))
+            if _idk:
+                lap_totals[_idk] = max(lap_totals.get(_idk, 0), lap_peak_kills)
         _close_stage(client, reader, key, s_ts, e_ts, outcome=outcome, **kwargs)
 
     def _calc_outcome(key, kills, alive, duration_ms) -> str:
@@ -2104,6 +2339,19 @@ def run_loop(client, hz: float = 0.5, stop_event: threading.Event | None = None,
     while not (stop_event and stop_event.is_set()):
         try:
             data = reader.tick()
+
+            # Auto-cura do seed: se esta versão foi auto-escaneada (não estava no
+            # calib_seed) e a calibração já está completa e saudável, reporta os
+            # offsets ao backend UMA vez — pra semear o calib_seed e ninguém mais
+            # precisar escanear. ConsoleClient não tem report_calib → ignora.
+            if (not calib_reported and reader._ver
+                    and hasattr(client, "report_calib")):
+                snap = reader.calib_snapshot()
+                if snap and not snap.pop("seeded"):
+                    client.report_calib(reader._ver, snap)
+                    calib_reported = True
+                elif snap:
+                    calib_reported = True   # versão já no seed — não há o que reportar
 
             if data is None:
                 if reader.is_attached:
@@ -2204,6 +2452,27 @@ def run_loop(client, hz: float = 0.5, stop_event: threading.Event | None = None,
 
                 outcome = reader.check_events()  # 'success'/'fail'/None
 
+                if os.environ.get("TBH_DUMP_OFFSETS"):
+                    _ls = reader._all_log_sizes()
+                    if _ls != _prev_log_sizes:
+                        _log(f"[dbg-log] sizes por elogtype: {_ls}")
+                        _prev_log_sizes = _ls
+
+                # ── Resolve abandono adiado ───────────────────────────────────
+                # Um clear/fail no log dentro da janela = foi conclusão (cancela, sem
+                # duplicata). Sem evento na janela = abandono de verdade → fecha.
+                if pending_abandon is not None:
+                    if outcome:
+                        pending_abandon = None
+                    else:
+                        pending_abandon['ticks'] += 1
+                        if pending_abandon['ticks'] >= ABANDON_WAIT_TICKS:
+                            pa = pending_abandon
+                            pending_abandon = None
+                            _do_close(pa['key'], pa['start_ts'], pa['end_ts'],
+                                      outcome='abandoned', heroes=_read_save_heroes())
+                            print(f"[companion] stage abandoned (dur={(pa['end_ts']-pa['start_ts'])//1000}s): key={pa['key']}")
+
                 # ── Detecção de outcome via log (quando funcionar) ────────────
                 if outcome and last_key is not None:
                     box_baseline = reader._log_box_sz
@@ -2226,19 +2495,25 @@ def run_loop(client, hz: float = 0.5, stop_event: threading.Event | None = None,
                             # tick sem mobs (gap_start_ts), não o tick atual de detecção do retry.
                             real_end_ts = (gap_start_ts if (gap_start_ts and force_stage_reset) else now)
                             duration_ms = real_end_ts - (start_ts or real_end_ts)
-                            # Heurística de conclusão: usa o último estado conhecido do
-                            # stage anterior. O stageKey muda no mesmo tick que o último
-                            # mob morre — prev_data captura o estado pré-transição.
                             pd_alive = prev_data.get('mobsAlive', 999) if prev_data else 999
-                            effective_outcome = _calc_outcome(last_key, kills_tracked, pd_alive, duration_ms)
-                            heroes = _read_save_heroes()
-                            _do_close(last_key, start_ts, real_end_ts,
-                                      outcome=effective_outcome, heroes=heroes)
-                            print(
-                                f"[companion] stage {effective_outcome} "
-                                f"(kills={kills_tracked} alive={pd_alive} dur={duration_ms//1000}s): "
-                                f"{data.get('label', last_key)}"
-                            )
+                            if reader._has_log:
+                                # Com log oficial: a troca de key pode ser CLEAR (o StageClear
+                                # chega ~0.6s depois) ou ABANDONO. Adia a decisão — se um clear/
+                                # fail aparecer no log em ABANDON_WAIT_TICKS, descarta (sem
+                                # fantasma/duplicata); senão fecha como 'abandoned' abaixo.
+                                pending_abandon = {'key': last_key, 'start_ts': start_ts,
+                                                   'end_ts': real_end_ts, 'ticks': 0}
+                            else:
+                                # Sem log oficial (versões antigas): fecha por heurística (wall).
+                                effective_outcome = _calc_outcome(last_key, kills_tracked, pd_alive, duration_ms)
+                                heroes = _read_save_heroes()
+                                _do_close(last_key, start_ts, real_end_ts,
+                                          outcome=effective_outcome, heroes=heroes)
+                                print(
+                                    f"[companion] stage {effective_outcome} "
+                                    f"(kills={kills_tracked} alive={pd_alive} dur={duration_ms//1000}s): "
+                                    f"{data.get('label', last_key)}"
+                                )
                         dead_now = reader._raw_dead_count()
                         reader.reset_stage(dead_baseline=dead_now)
                         reader._last_key = key  # garante fallback correto em wave gaps do novo stage
@@ -2265,9 +2540,10 @@ def run_loop(client, hz: float = 0.5, stop_event: threading.Event | None = None,
                     elapsed_s = max(1, (now - start_ts) / 1000)
                     payload   = {**data, "startTs": start_ts, "companionVersion": COMPANION_VERSION,
                                  "mobsKilledTracked": kills_tracked}
-                    # Total adaptativo: kills no último clear deste stage (auto-calibra
-                    # o totalMobs do calib, que estava alto → barra parava na metade).
-                    _lt = lap_totals.get(key)
+                    # Total de mobs: 1º o catálogo estático do jogo pelo stageKey real;
+                    # fallback = adaptativo (kills no último clear, por identidade estável).
+                    _cat = STAGE_CATALOG.get(data.get("stageKey"))
+                    _lt  = (_cat[3] if _cat else 0) or lap_totals.get(_lap_key(data))
                     if _lt and _lt > 0:
                         payload["totalMobs"] = _lt
                     # Timer congelado no gap final: durante os ticks sem mobs (fallback)
@@ -2329,8 +2605,11 @@ def _close_stage(client, reader: "StageReader", stage_key, start_ts, end_ts,
     # SÓ para fechamentos incertos por relógio de parede (heurística: abandono/
     # abertura no meio), que podem ser falsos-positivos de gaps entre ondas.
     confirmed = (time_source == "game") or (outcome in ("success", "fail", "invalid"))
-    if not confirmed and duration < 15_000:
-        print(f"[close] ignorado — duração {duration//1000}s < 15s incerto "
+    # Piso só p/ fechamentos NÃO-confirmados (abandonos por heurística). Clears/mortes
+    # oficiais (fonte=game) e success/fail/invalid são confirmed → sem piso (bosses de
+    # 2s são gravados). 4s evita registrar idas-e-vindas instantâneas.
+    if not confirmed and duration < 4_000:
+        print(f"[close] ignorado — duração {duration//1000}s < 4s incerto "
               f"(fonte={time_source} outcome={outcome} stage_key={stage_key})")
         return
 
@@ -2359,31 +2638,14 @@ def _close_stage(client, reader: "StageReader", stage_key, start_ts, end_ts,
     }
     if game_secs:
         record["clearTimeSec"] = game_secs
-    if info and len(info) >= 4:
-        act, stage_no, total_mobs, diff_idx = info
-        record.update({
-            "act":        act,
-            "stageNo":    stage_no,
-            "difficulty": diff_idx,
-            "diffName":   DIFFICULTY.get(diff_idx, str(diff_idx)),
-            "totalMobs":  total_mobs,
-            "label":      f"{DIFFICULTY.get(diff_idx, '?')} {act}-{stage_no}",
-        })
-    else:
-        # Fallback 1: decodifica stageKey diretamente
-        act, sno, diff = _decode_stage_key(stage_key)
-        # Fallback 2: StageClearLog (só em success, pode ter act/sno mais preciso)
-        if log_info:
-            act = log_info["act"]
-            sno = log_info["stageNo"]
-        if act and sno:
-            diff_name = DIFFICULTY.get(diff, '') if diff is not None else ''
-            record.update({
-                "act":     act,
-                "stageNo": sno,
-                **({"difficulty": diff, "diffName": diff_name} if diff is not None else {}),
-                "label":   f"{diff_name} {act}-{sno}".strip(),
-            })
+    # Identidade (act/stage/diff/label): do StageClearLog (log_info), não do decode.
+    ident = reader._identity_from(stage_key, log_info)
+    if ident:
+        record.update(ident)
+    # totalMobs: catálogo estático do jogo pelo stageKey real.
+    _cat = STAGE_CATALOG.get(stage_key)
+    if _cat and _cat[3] > 0:
+        record["totalMobs"] = _cat[3]
     label = record.get('label')
     print(f"[close] {label or stage_key} outcome={outcome} dur={duration//1000}s "
           f"(fonte={time_source}) dmg={total_dmg}")
@@ -2646,17 +2908,35 @@ def main():
         _finish_update(sys.argv[2], int(sys.argv[3]))
         return
 
+    # Instala no diretório gerenciado e relança de lá (1ª vez a partir da
+    # Downloads). Antes do lock: esta cópia sai sem tê-lo escrito; a instalada
+    # cuida do kill_previous + lock normalmente.
+    if _ensure_installed():
+        return
+
     _kill_previous_instance()
 
     ap = argparse.ArgumentParser(description="TBH Tracker")
     ap.add_argument("--hz",      type=float, default=2.0)
     ap.add_argument("--console", action="store_true")
+    ap.add_argument("--backend", default=None,
+                    help="URL do backend (ex.: http://localhost:3000). Também via env TBH_BACKEND.")
     args = ap.parse_args()
 
+    # --backend sobrescreve o global (as funções de pareamento/escrita leem em runtime)
+    global BACKEND_BASE
+    if args.backend:
+        BACKEND_BASE = args.backend.rstrip("/")
+
     session = _load_session()
+    # O token de sessão é específico do backend — só força novo pareamento se a
+    # sessão salva for de OUTRO backend (permite reiniciar no mesmo sem re-parear).
+    if session and (session.get("backend") or "https://www.tbhtracker.online") != BACKEND_BASE:
+        print(f"[backend] sessão salva era de {session.get('backend')} → forçando novo pareamento p/ {BACKEND_BASE}")
+        session = None
 
     # Startup log — útil para diagnosticar o exe bundled
-    log_path = os.path.join(os.path.expanduser("~"), "TBHTracker_startup.log")
+    log_path = os.path.join(_LOGS_DIR, "startup.log")
     with open(log_path, "w") as f:
         f.write(f"exe: {sys.executable}\n")
         f.write(f"frozen: {getattr(sys, 'frozen', False)}\n")
@@ -2756,7 +3036,7 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         import traceback
-        log_path = os.path.join(os.path.expanduser("~"), "TBHTracker_error.log")
+        log_path = os.path.join(_LOGS_DIR, "error.log")
         with open(log_path, "w") as f:
             f.write(traceback.format_exc())
         raise

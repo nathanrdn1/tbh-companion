@@ -5,7 +5,7 @@ a = Analysis(
     ['tbh_companion.py'],
     pathex=[],
     binaries=[],
-    datas=[('calib_seed.json', '.'), ('icon.ico', '.')],
+    datas=[('calib_seed.json', '.'), ('stage_totals.json', '.'), ('icon.ico', '.')],
     hiddenimports=['pystray', 'pystray._win32', 'PIL', 'PIL.Image', 'PIL.ImageDraw', 'PIL.ImageFont', 'tkinter', 'tkinter.ttk'],
     hookspath=[],
     hooksconfig={},
